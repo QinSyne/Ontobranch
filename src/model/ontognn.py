@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 OntoGNN —— 本体感知图神经网络 (Ontology-Aware GNN)
-
 架构别名：三明治架构 (Sandwich Architecture)
   面包片①  Stage 0: 特征投影     (Input Projections)
   ─────────────────────────────────────────────────────
@@ -15,26 +14,19 @@ OntoGNN —— 本体感知图神经网络 (Ontology-Aware GNN)
   ─────────────────────────────────────────────────────
   芯       Stage 4: 决策头       (Scoring Head) [下半部实现]
             每个 variable 输出一个分数，越高越优先被 SCIP 选为分支变量
-
 Author: OntoBranch-2026 Team
 """
-
 from __future__ import annotations
-
 from typing import Dict, Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch_geometric.data import HeteroData
 from torch_geometric.nn import GATConv, HeteroConv, SAGEConv
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # 常量：与数学层对接的固定维度
 # ─────────────────────────────────────────────────────────────────────────────
-
 # Ecole NodeBipartite 观测中 variable_features 的固定列数（19 列）
 # 在 Stage 3 数学推理中会用到，这里提前声明以便 __init__ 分配正确大小的 Linear
 _ECOLE_VAR_DIM  = 19   # variable  原始观测维度
