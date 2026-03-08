@@ -1,0 +1,70 @@
+name: ontobranch-2026
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - default
+dependencies:
+  # Core Python
+  - python=3.10
+  
+  # CUDA support for GPU
+  - pytorch
+  - torchvision 
+  - torchaudio
+  - pytorch-cuda=12.1  # Adjust to your CUDA version if needed
+  
+  # Scientific computing
+  - numpy
+  - scipy
+  - scikit-learn
+  
+  # Data handling  
+  - pandas
+  - networkx
+  
+  # Visualization & Development
+  - matplotlib
+  - seaborn
+  - jupyter
+  - ipython
+  - tqdm
+  - pyyaml
+  
+  # Essential tools
+  - pip
+  - git
+  
+  # Pip installations (more complex dependencies)
+  - pip:
+    # PyTorch Geometric (install after PyTorch)
+    - torch-geometric
+    - torch-scatter
+    - torch-sparse  
+    - torch-cluster
+    - torch-spline-conv
+    
+    # SCIP & Optimization
+    - ecole>=0.8.1
+    - pyscipopt
+    
+    # Experiment tracking & configs
+    - wandb
+    - tensorboard
+    - hydra-core
+    
+    # Development tools
+    - rich
+    - click
+    - pytest
+    - black
+    - isort
+    - flake8
+    
+    # Optional (comment out if no license)
+    # - gurobipy
+
+# Post-installation notes:
+# 1. Verify CUDA: python -c "import torch; print(torch.cuda.is_available())"  
+# 2. Test PyG: python -c "import torch_geometric; print('PyG OK')"
+# 3. Test Ecole: python -c "import ecole; print('Ecole OK')"
