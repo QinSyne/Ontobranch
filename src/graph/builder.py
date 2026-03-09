@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """
-OntologyGraphBuilder —— 异构图构建器
+UniversalGraphBuilder通用语义图构建器
 
-将 Generator 输出的 (.json, Ecole obs) 对转换为 PyG HeteroData，
-供 OntoGNN 消费。
+========================== 架构核心思想 ==========================
+  由于 USG 范式下所有业务节点统一为 "entity"、所有语义边统一为
+  "relates_to"，图构建器不再需要动态按类型分桶。
 
-构建的图包含三层：
-  ① 语义层   : 来自 JSON nodes（如 Employee, Shift 节点）
-               + 来自 JSON edges（如 same_day 边）
-  ② 桥接层   : variable → 语义实体 的边
-               （来自 JSON variable_map）
-  ③ 数学层   : variable / constraint 节点 + variable↔constraint 二分图边
-               （来自 Ecole NodeBipartite 观测）
+  输出的 HeteroData 拓扑结构 **绝对固定**：
+    3 种节点：variable, constraint, entity
+    3 种边  ：constrains, mapped_to, relates_to
 
-核心设计：字符串 ID → PyG 局部整数索引 的转换
-  PyG 的 edge_index 只认 0, 1, 2... 这样的局部索引。
-  JSON 里的节点 ID 是字符串（"emp_0", "shift_3"）。
-  解析时我们维护一个两层字典：
-    id_to_idx["Employee"]["emp_0"] = 0
-    id_to_idx["Shift"]["shift_3"] = 3
-  所有涉及节点引用的地方，都通过这个字典做一次查表转换。
+  这意味着 OntoGNN 模型可以拥有完全静态的参数结构——不再需要
+  metadata 驱动的动态层注册。
+
+构建三层图：
+  ① 数学层   : variable[N, 19] + constraint[C, 5]
+               + ("variable", "constrains", "constraint")
+  ② 语义层   : entity[E, 128]
+               + ("entity", "relates_to", "entity")
+  ③ 桥接层   : ("variable", "mapped_to", "entity")
+
+ID 映射机制：
+  单一映射表 id_to_idx["emp_0"] = 0, id_to_idx["shift_0"] = 20, ...
+  所有 entity 共享同一个局部索引空间。
 
 Author: OntoBranch-2026 Team
 """
@@ -27,237 +30,181 @@ Author: OntoBranch-2026 Team
 import json
 import numpy as np
 import torch
-from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
-
 from torch_geometric.data import HeteroData
+from src.generator.base_generator import GLOBAL_ENT_DIM
 
-
-class OntologyGraphBuilder:
+class UniversalGraphBuilder:
     """
-    读取 Generator 输出的 JSON，构建三层 PyG HeteroData。
+    USG 极简构建器：将 (JSON, Ecole obs) 转换为结构固定的 HeteroData。
 
-    直接使用 JSON nodes 里的 features 列表作为节点特征，
-    不再需要额外的特征编码器（Generator 已经把特征算好了）。
+    输出保证恰好包含 3 种节点 + 3 种边，无论输入来自哪个业务领域。
     """
 
     def __init__(self, json_data: Dict[str, Any], verbose: bool = False):
         self.raw     = json_data
         self.verbose = verbose
 
-        # 按类型分组的节点列表
-        self._nodes_by_type: Dict[str, List[Dict]] = {}
-
-        # 字符串 ID → 局部整数索引的两层查找表（最重要！）
-        # {"Employee": {"emp_0": 0, "emp_1": 1, ...},
-        #  "Shift":    {"shift_0": 0, "shift_1": 1, ...}}
-        self._id_to_idx: Dict[str, Dict[str, int]] = {}
-
+        # ── entity 节点列表与 ID → 局部索引映射 ──
+        # 因为 USG 下所有业务节点都是 "entity"，只需要一个 flat 映射
+        self._entity_nodes: List[Dict] = []
+        self._id_to_idx: Dict[str, int] = {}
         self._parse_nodes()
+
+    # ─────────────────────────────────────────────────────────────────
+    #  节点解析
+    # ─────────────────────────────────────────────────────────────────
 
     def _parse_nodes(self):
         """
-        遍历 JSON 的 nodes 列表，按 type 分组，并建立 id_to_idx 映射。
+        遍历 JSON nodes 列表，构建 entity 节点索引。
 
-        JSON 格式保证每个 node 有三个字段：
-          {"id": "emp_0", "type": "Employee", "features": [1.13, 12.5, 0.0, 1.0, 0.0]}
-
-        关键操作：
-          local_idx = 该类型节点的顺序编号（从 0 开始）
-          id_to_idx["Employee"]["emp_0"] = local_idx
-
-        为什么不用全局 ID？
-          PyG 的 HeteroData 为每种节点类型维护独立的特征矩阵。
-          "Employee" 的矩阵下标从 0 开始，"Shift" 也从 0 开始，互相独立。
-          所以 emp_0 的局部索引是 0，shift_0 的局部索引也是 0，并不冲突。
+        USG 契约保证所有节点的 type == "entity"，因此不需要按类型分桶。
+        id_to_idx 是一个 flat 字典：
+          {"emp_0": 0, "emp_1": 1, ..., "shift_0": 20, "shift_1": 21, ...}
         """
         for node in self.raw.get("nodes", []):
-            ntype   = node["type"]
             node_id = node["id"]
-
-            if ntype not in self._nodes_by_type:
-                self._nodes_by_type[ntype] = []
-                self._id_to_idx[ntype]     = {}
-
-            # local_idx = 当前该类型已有节点的数量（0-indexed）
-            local_idx = len(self._nodes_by_type[ntype])
-            self._nodes_by_type[ntype].append(node)
-            self._id_to_idx[ntype][node_id] = local_idx
+            local_idx = len(self._entity_nodes)
+            self._entity_nodes.append(node)
+            self._id_to_idx[node_id] = local_idx
 
         if self.verbose:
-            for ntype, nlist in self._nodes_by_type.items():
-                print(f"  [parse_nodes] {ntype}: {len(nlist)} nodes")
-
-    def _find_type(self, node_id: str) -> str:
-        """
-        在 _id_to_idx 里逐类型查找 node_id，返回它的类型名。
-
-        例：_find_type("shift_3") → "Shift"
-
-        如果找不到，直接 raise KeyError（遵守 No Guessing 原则）。
-        """
-        for ntype, id_map in self._id_to_idx.items():
-            if node_id in id_map:
-                return ntype
-        raise KeyError(
-            f"节点 id '{node_id}' 在所有类型中均未找到。"
-            f"已注册类型: {list(self._id_to_idx.keys())}"
-        )
-
+            print(f"  [parse_nodes] entity: {len(self._entity_nodes)} nodes")
+    # ─────────────────────────────────────────────────────────────────
+    #  语义层：entity 节点特征 + relates_to 边
+    # ─────────────────────────────────────────────────────────────────
     def _build_semantic_layer(self, data: HeteroData):
         """
-        构建语义节点特征矩阵，并将语义边写入 HeteroData。
+        构建 entity 节点特征矩阵和 relates_to 语义边。
 
-        节点特征：
-          直接把 JSON node["features"] 列表堆叠成矩阵。
-          例：Employee 有 15 个节点，每个 features 长度 5
-           → data["Employee"].x = Tensor[15, 5]
+        entity 特征：
+          每个 node["features"] 已由 Generator 对齐到 GLOBAL_ENT_DIM (128) 维。
+          直接堆叠为 Tensor[num_entities, 128]。
 
-        语义边（来自 JSON edges）：
-          每条边 {"src": "shift_0", "dst": "shift_4", "rel": "same_day"}
-          → src_type = _find_type("shift_0") = "Shift"
-          → src_local = _id_to_idx["Shift"]["shift_0"] = 0
-          → dst_local = _id_to_idx["Shift"]["shift_4"] = 4
-          → 写入 data["Shift", "same_day", "Shift"].edge_index
-
-        边特征（可选）：
-          若边携带 "features" 字段（如 VRP 的距离/成本）：
-            {"src":"loc_0","dst":"loc_1","rel":"road","features":[12.5,0.8]}
-          则同类型的所有边若均有 features，
-          → data["Loc","road","Loc"].edge_attr = Tensor[num_edges, feat_dim]
-          若只有部分边携带 features（数据不一致），则跳过 edge_attr，不猜测补零。
+        relates_to 边：
+          USG 下所有语义边的 rel 都是 "relates_to"，
+          src 和 dst 都映射到同一个 entity 索引空间。
         """
-        # 节点特征矩阵
-        for ntype, node_list in self._nodes_by_type.items():
-            features = [n["features"] for n in node_list]
-            data[ntype].x = torch.tensor(features, dtype=torch.float32)
-            if self.verbose:
-                print(f"  [semantic_nodes] {ntype}: {data[ntype].x.shape}")
+        # ── entity 节点特征矩阵 ──
+        if self._entity_nodes:
+            features = [n["features"] for n in self._entity_nodes]
+            data["entity"].x = torch.tensor(features, dtype=torch.float32)
+        else:
+            # 无实体节点时的占位（理论上不应发生，但确保不崩溃）
+            data["entity"].x = torch.zeros(0, GLOBAL_ENT_DIM, dtype=torch.float32)
 
-        # 语义边：先分桶，再转 tensor
-        # key = (src_type, rel, dst_type)
-        # 每个桶是三元组：(src 列表, dst 列表, 边特征向量列表)
-        # 边特征向量列表里存 List[float] 或 None（无 features 字段时）
-        edge_bucket: Dict[Tuple, Tuple[List, List, List]] = defaultdict(
-            lambda: ([], [], [])
-        )
+        if self.verbose:
+            print(f"  [semantic_nodes] entity: {data['entity'].x.shape}")
+
+        # ── relates_to 语义边 ──
+        src_list: List[int] = []
+        dst_list: List[int] = []
 
         for edge in self.raw.get("edges", []):
             src_id = edge["src"]
             dst_id = edge["dst"]
-            rel    = edge["rel"]
 
-            src_type  = self._find_type(src_id)
-            dst_type  = self._find_type(dst_id)
-            src_local = self._id_to_idx[src_type][src_id]
-            dst_local = self._id_to_idx[dst_type][dst_id]
+            if src_id not in self._id_to_idx or dst_id not in self._id_to_idx:
+                raise KeyError(
+                    f"语义边引用了未注册的节点 ID: src='{src_id}', dst='{dst_id}'。"
+                    f"已注册 ID: {list(self._id_to_idx.keys())[:10]}..."
+                )
 
-            bucket = edge_bucket[(src_type, rel, dst_type)]
-            bucket[0].append(src_local)
-            bucket[1].append(dst_local)
-            # features 字段可选：无则追加 None，有则追加特征向量
-            bucket[2].append(edge.get("features", None))
+            src_list.append(self._id_to_idx[src_id])
+            dst_list.append(self._id_to_idx[dst_id])
 
-        for (src_type, rel, dst_type), (srcs, dsts, feats) in edge_bucket.items():
-            data[src_type, rel, dst_type].edge_index = torch.tensor(
-                [srcs, dsts], dtype=torch.long
+        if src_list:
+            data["entity", "relates_to", "entity"].edge_index = torch.tensor(
+                [src_list, dst_list], dtype=torch.long
+            )
+        else:
+            # 无语义边时的占位（空 edge_index，保证图结构完整）
+            data["entity", "relates_to", "entity"].edge_index = torch.zeros(
+                2, 0, dtype=torch.long
             )
 
-            # 只有当 **所有** 边都携带特征时，才写出 edge_attr。
-            # 部分缺失视为数据不一致，跳过而非靠猜测补零。
-            if feats and all(f is not None for f in feats):
-                data[src_type, rel, dst_type].edge_attr = torch.tensor(
-                    feats, dtype=torch.float32
-                )
-                if self.verbose:
-                    ea = data[src_type, rel, dst_type].edge_attr
-                    print(
-                        f"  [semantic_edges] ('{src_type}','{rel}','{dst_type}'): "
-                        f"{len(srcs)} edges, edge_attr {ea.shape}"
-                    )
-            else:
-                if self.verbose:
-                    print(
-                        f"  [semantic_edges] ('{src_type}','{rel}','{dst_type}'): "
-                        f"{len(srcs)} edges (no edge_attr)"
-                    )
+        if self.verbose:
+            ei = data["entity", "relates_to", "entity"].edge_index
+            print(f"  [semantic_edges] ('entity','relates_to','entity'): {ei.shape[1]} edges")
+
+    # ─────────────────────────────────────────────────────────────────
+    #  桥接层：variable → entity 的 mapped_to 边
+    # ─────────────────────────────────────────────────────────────────
 
     def _build_bridge_layer(self, data: HeteroData):
         """
-        遍历 variable_map，建立 variable → 语义实体 的桥接边。
+        遍历 variable_map，建立 variable → entity 的桥接边。
 
-        variable_map 中每条记录：
-          {
-            "var_index": 5,
-            "mappings": [
-              {"type": "Employee", "id": "emp_1"},
-              {"type": "Shift",    "id": "shift_5"},
-            ]
-          }
-
-        转换逻辑：
-          var_idx = 5（SCIP 变量列号 = data["variable"] 的局部索引）
-
-          对 {"type": "Employee", "id": "emp_1"}：
-            ent_local = _id_to_idx["Employee"]["emp_1"] = 1
-            → 写入 data["variable", "mapped_to", "Employee"].edge_index
-              src=5, dst=1
-
-          对 {"type": "Shift", "id": "shift_5"}：
-            ent_local = _id_to_idx["Shift"]["shift_5"] = 5
-            → 写入 data["variable", "mapped_to", "Shift"].edge_index
-              src=5, dst=5
-
-        关系名统一用 "mapped_to"——不同目标类型的 edge_type 三元组不同，
-        不需要在关系名上再区分。
+        USG 下所有 mappings 的 type 都是 "entity"，因此只需要一组
+        ("variable", "mapped_to", "entity") 边，不再按实体类型分桶。
         """
-        # key = entity_type 字符串（src 固定是 "variable"，rel 固定是 "mapped_to"）
-        bridge_bucket: Dict[str, Tuple[List, List]] = defaultdict(lambda: ([], []))
+        var_src_list: List[int] = []
+        ent_dst_list: List[int] = []
 
         for entry in self.raw.get("variable_map", []):
-            var_idx  = entry["var_index"]
+            var_idx = entry["var_index"]
             for mapping in entry["mappings"]:
-                etype     = mapping["type"]
-                eid       = mapping["id"]
-                ent_local = self._id_to_idx[etype][eid]  # 查表
-                bridge_bucket[etype][0].append(var_idx)
-                bridge_bucket[etype][1].append(ent_local)
+                eid = mapping["id"]
+                if eid not in self._id_to_idx:
+                    raise KeyError(
+                        f"variable_map 引用了未注册的实体 ID: '{eid}'。"
+                    )
+                ent_local = self._id_to_idx[eid]
+                var_src_list.append(var_idx)
+                ent_dst_list.append(ent_local)
 
-        for etype, (srcs, dsts) in bridge_bucket.items():
-            data["variable", "mapped_to", etype].edge_index = torch.tensor(
-                [srcs, dsts], dtype=torch.long
+        if var_src_list:
+            data["variable", "mapped_to", "entity"].edge_index = torch.tensor(
+                [var_src_list, ent_dst_list], dtype=torch.long
             )
-            if self.verbose:
-                print(f"  [bridge] ('variable','mapped_to','{etype}'): {len(srcs)}")
+        else:
+            data["variable", "mapped_to", "entity"].edge_index = torch.zeros(
+                2, 0, dtype=torch.long
+            )
+
+        if self.verbose:
+            ei = data["variable", "mapped_to", "entity"].edge_index
+            print(f"  [bridge] ('variable','mapped_to','entity'): {ei.shape[1]} edges")
+
+    # ─────────────────────────────────────────────────────────────────
+    #  数学层：variable / constraint 节点 + constrains 边
+    # ─────────────────────────────────────────────────────────────────
 
     def _build_math_layer(self, data: HeteroData, ecole_obs=None):
         """
         从 Ecole NodeBipartite 观测中提取数学层特征。
 
-        Ecole NodeBipartite 观测结构：
-          obs.variable_features  : np.ndarray [num_vars, 19]
-          obs.row_features        : np.ndarray [num_constraints, 5]
-          obs.edge_features.indices : np.ndarray [2, num_edges]
+        Ecole 观测结构：
+          obs.variable_features  : ndarray [N_var, 19]
+          obs.row_features       : ndarray [N_con, 5]
+          obs.edge_features.indices : ndarray [2, E]
             indices[0] = constraint 行号
             indices[1] = variable 列号
 
-        ⚠ 两个安全处理：
-          1. NaN 清洗：Ecole 对不适用特征填 NaN → 替换为 0
-          2. None 检查：用 `if x is None`，禁止 `if not x`（numpy array 歧义）
+        安全处理：
+          ① NaN → 0.0（np.nan_to_num）
+          ② None 检查使用 `if x is None`（numpy array 兼容）
+          ③ ecole_obs=None 时退化为全零占位
 
-        边方向：edge type 为 ('variable', 'constrains', 'constraint')
-          src = variable = indices[1]
-          dst = constraint = indices[0]
-          → 需要把 indices 的两行交换
+        边方向：("variable", "constrains", "constraint")
+          src = variable = indices[1], dst = constraint = indices[0]
         """
         num_vars = len(self.raw.get("variable_map", []))
 
         if ecole_obs is None:
-            data["variable"].x   = torch.zeros(num_vars, 1)
-            data["constraint"].x = torch.zeros(1, 1)
+            # 无 Ecole 观测：全零占位（维度依然是 19 / 5）
+            data["variable"].x   = torch.zeros(num_vars, 19, dtype=torch.float32)
+            data["constraint"].x = torch.zeros(1, 5, dtype=torch.float32)
+            # 占位边：对角线连接
+            k = min(num_vars, 1)
+            data["variable", "constrains", "constraint"].edge_index = torch.stack(
+                [torch.arange(k, dtype=torch.long),
+                 torch.arange(k, dtype=torch.long)]
+            )
             return
 
-        # variable 特征（兼容不同 Ecole 版本的属性名）
+        # ── variable 特征 [N_var, 19] ──
         _vf = getattr(ecole_obs, "variable_features", None)
         if _vf is None:
             _vf = getattr(ecole_obs, "column_features", None)
@@ -266,9 +213,9 @@ class OntologyGraphBuilder:
             _vf = np.nan_to_num(np.asarray(_vf, dtype=np.float32), nan=0.0)
             data["variable"].x = torch.from_numpy(_vf)
         else:
-            data["variable"].x = torch.zeros(num_vars, 1)
+            data["variable"].x = torch.zeros(num_vars, 19, dtype=torch.float32)
 
-        # constraint 特征
+        # ── constraint 特征 [N_con, 5] ──
         _cf = getattr(ecole_obs, "row_features", None)
         if _cf is None:
             _cf = getattr(ecole_obs, "constraint_features", None)
@@ -277,15 +224,15 @@ class OntologyGraphBuilder:
             _cf = np.nan_to_num(np.asarray(_cf, dtype=np.float32), nan=0.0)
             data["constraint"].x = torch.from_numpy(_cf)
         else:
-            data["constraint"].x = torch.zeros(1, 1)
+            data["constraint"].x = torch.zeros(1, 5, dtype=torch.float32)
 
-        # variable ↔ constraint 二分图边
+        # ── variable ↔ constraint 二分图边 ──
         edge_feat = getattr(ecole_obs, "edge_features", None)
         if edge_feat is not None:
             indices = getattr(edge_feat, "indices", None)
             if indices is not None:
                 idx = np.asarray(indices, dtype=np.int64)
-                # 交换两行：src=variable(idx[1]), dst=constraint(idx[0])
+                # 交换行：src=variable(idx[1]), dst=constraint(idx[0])
                 ei = torch.tensor(np.stack([idx[1], idx[0]]), dtype=torch.long)
                 data["variable", "constrains", "constraint"].edge_index = ei
                 if self.verbose:
@@ -300,17 +247,34 @@ class OntologyGraphBuilder:
         nc = data["constraint"].x.shape[0]
         k  = min(nv, nc)
         data["variable", "constrains", "constraint"].edge_index = torch.stack(
-            [torch.arange(k), torch.arange(k)]
+            [torch.arange(k, dtype=torch.long),
+             torch.arange(k, dtype=torch.long)]
         )
 
+    # ─────────────────────────────────────────────────────────────────
+    #  主构建入口
+    # ─────────────────────────────────────────────────────────────────
+
     def build(self, ecole_obs=None) -> HeteroData:
-        """按顺序构建三层，返回完整 HeteroData。"""
+        """
+        按顺序构建三层，返回结构固定的 HeteroData。
+
+        输出保证恰好包含：
+          节点：variable, constraint, entity
+          边  ：("variable", "constrains", "constraint")
+               ("entity", "relates_to", "entity")
+               ("variable", "mapped_to", "entity")
+        """
         data = HeteroData()
-        self._build_math_layer(data, ecole_obs)   # ① variable / constraint
-        self._build_semantic_layer(data)           # ② Employee / Shift / ...
-        self._build_bridge_layer(data)             # ③ variable → entity
+        self._build_math_layer(data, ecole_obs)    # ① variable / constraint
+        self._build_semantic_layer(data)            # ② entity + relates_to
+        self._build_bridge_layer(data)              # ③ variable → entity
         return data
 
+
+# ═════════════════════════════════════════════════════════════════════
+#  便捷接口
+# ═════════════════════════════════════════════════════════════════════
 
 def load_and_build(
     json_path: str,
@@ -318,7 +282,7 @@ def load_and_build(
     verbose: bool = False,
 ) -> HeteroData:
     """
-    从 JSON 文件路径加载实例，构建并返回 HeteroData。
+    从 JSON 文件路径加载实例，构建并返回结构固定的 HeteroData。
 
     参数
     ----
@@ -328,10 +292,18 @@ def load_and_build(
 
     返回
     ----
-    HeteroData，节点类型动态取决于 JSON 中的 type 字段
+    HeteroData，拓扑结构固定为 3 节点 + 3 边
+
+    示例
+    ----
+    >>> data = load_and_build("data/raw/employee_scheduling/es_001.json")
+    >>> data.node_types   # ['variable', 'constraint', 'entity']
+    >>> data.edge_types   # [('variable','constrains','constraint'),
+    ...                   #  ('entity','relates_to','entity'),
+    ...                   #  ('variable','mapped_to','entity')]
     """
     with open(json_path, "r", encoding="utf-8") as f:
         json_data = json.load(f)
 
-    builder = OntologyGraphBuilder(json_data, verbose=verbose)
+    builder = UniversalGraphBuilder(json_data, verbose=verbose)
     return builder.build(ecole_obs=ecole_obs)
