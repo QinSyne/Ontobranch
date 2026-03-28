@@ -1,5 +1,9 @@
 import os
 import sys
+
+# 【兼容性修复】启用 MPS(Mac GPU) 不支持的 scatter 算子的 CPU 回退
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 import torch
 import torch.optim as optim
 from torch_geometric.loader import DataLoader
@@ -10,6 +14,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 from src.train.dataset import OntoDataset
 from src.model.ontognn import OntoGNN
 from src.train.loss import bipartite_infonce_loss
+from src.train.metrics import evaluate_batch
 
 def main():
     print("=" * 60)
@@ -38,14 +43,16 @@ def main():
     loader = DataLoader(dataset, batch_size=5, shuffle=True)
     print(f"📦 Dataset loaded: {len(dataset)} graphs found.")
 
-    model = OntoGNN(hidden_dim=64).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    model = OntoGNN(hidden_dim=128).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=5e-4)
     
     # 3. 开启训练循环
-    num_epochs = 20
+    num_epochs = 100
     
     for epoch in range(num_epochs):
         model.train()
+        total_ndcg = 0.0
+        total_acc = 0.0
         total_loss = 0.0
         num_batches = 0
         
@@ -71,16 +78,21 @@ def main():
                 tau=0.1
             )
             
-            # 反向传播和步进策略更新
-            loss.backward()
+            batch_ndcg, batch_acc = evaluate_batch(scores.detach(), labels, batch_idx, k=5)
+            
             optimizer.step()
             
             total_loss += loss.item()
+            total_ndcg += batch_ndcg
+            total_acc += batch_acc
             num_batches += 1
             
         # 计算该 Epoch 所有 batch 的平摊代价
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-        print(f"📅 Epoch [{epoch + 1:02d}/{num_epochs}] | Average InfoNCE Loss: {avg_loss:.4f}")
+        avg_ndcg = total_ndcg / num_batches if num_batches > 0 else 0.0
+        avg_acc = total_acc / num_batches if num_batches > 0 else 0.0
+        
+        print(f"📅 Epoch [{epoch + 1:02d}/{num_epochs}] | Loss: {avg_loss:.4f} | NDCG@5: {avg_ndcg:.4f} | Acc@5: {avg_acc:.4f}")
 
     print("=" * 60)
     print("🎉 MVP Training pipeline completed successfully! ")

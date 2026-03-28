@@ -1,0 +1,94 @@
+# ==============================================================================
+# OntoBranch-2026 (.gitignore)
+# ==============================================================================
+
+# 1. 环境与编辑器
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.conda/
+.python-version
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+*~
+
+# 2. Python 编译与常用缓存
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+coverage.xml
+*.cover
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 3. Jupyter Notebooks 缓存
+.ipynb_checkpoints/
+*.ipynb[_-]checkpoint
+
+# 4. PyTorch Geometric (PyG) 与 DGL 缓存
+# PyG 的 InMemoryDataset 默认生成 processed 目录用于存预处理的张量
+data/**/processed/
+data/**/raw/
+processed/
+dataset/*/processed/
+
+# 5. 原始图数据与生成标注 (非常重要，防止将上百MB的张量和JSON传上Git)
+data/raw/**/*.json
+data/raw/**/*.lp
+data/raw/**/*.pt
+data/processed/
+data/cache/
+*.json
+*.lp
+*.pt
+
+# 但保留数据根目录结构的 README 或示例，可以视需要取消下面两行的注释
+# !data/raw/**/README.md
+# !data/raw/**/example.json
+
+# 6. SCIP / Ecole 求解器输出的日志和缓存
+*.cip
+*.sol
+*.mps
+*.mps.gz
+*.lp.gz
+scip.log
+ecole_*.log
+
+# 7. 模型实验产出
+experiments/checkpoints/
+experiments/results/
+runs/
+wandb/
+tensorboard/
+*.pth
+*.ckpt
+*.onnx
+
+# 8. 杂项
+scripts/*.log
+scripts/writer.py
+*.log
+*.zip
+*.tar.gz
+*.csv

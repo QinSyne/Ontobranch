@@ -408,6 +408,11 @@ class OntoGNN(nn.Module):
         # Stage 0: 全部节点投影到 hidden_dim
         h_dict = self._project_all(x_dict)
 
+        # 【对称性破壁】在训练阶段为变量节点注入微小的高斯噪声，打破 1-WL 同构限制
+        if self.training:
+            noise = torch.randn_like(h_dict["variable"]) * 0.05
+            h_dict["variable"] = h_dict["variable"] + noise
+
         # Stage 1: entity 节点内部消息传递，带上边属性业务语义
         h_dict = self._semantic_encoding(h_dict, edge_index_dict, edge_attr_dict)
 

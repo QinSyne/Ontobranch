@@ -35,20 +35,30 @@ def bipartite_infonce_loss(
         y = labels[mask]
 
         num_vars = s.size(0)
-        # 如果当前图内的节点数太少，根本无法提供充足的 对比池（正样本 + 负样本），强制抛弃
-        if num_vars < 2:
+        # 计算有效专家打分的数量（过滤掉大量 padding 给定的 0.0）
+        real_mask = (y > 1e-6)
+        num_real = real_mask.sum().item()
+        
+        # 如果有效节点太少，根本无法提供充足的正样本排序，强制抛弃
+        if num_real < 2:
             continue
 
         # 按目标标签值大小逆序排列，值越大的在越前面
         sorted_indices = torch.argsort(y, descending=True)
 
-        # 取 Top XX% 为正样本池（最低需选取一个作为正样本）
-        num_pos = max(1, int(num_vars * pos_ratio))
-        # 取 Bottom 50% 的为负样本池（确保负样本量充足）
-        num_neg = max(1, int(num_vars * 0.5))
-
+        # 正样本池只在有效的、有打分的变量中按比例截取（最低 1 个）
+        num_pos = max(1, int(num_real * pos_ratio))
         pos_indices = sorted_indices[:num_pos]
-        neg_indices = sorted_indices[-num_neg:]
+        
+        # 海量负样本压制：把没有打分的（Padding 出来的 0.0 变量）全部当作负样本打压
+        neg_indices = sorted_indices[num_real:]
+        # 防止内存爆炸，随机采样最多 5000 个负样本
+        if len(neg_indices) > 5000:
+            neg_indices = neg_indices[torch.randperm(len(neg_indices))[:5000]]
+        
+        # 保护机制：如果没有能够压制的负样本，这个图就没法构造对比
+        if len(neg_indices) == 0:
+            continue
 
         # 获取对应的网络预测分数
         s_pos = s[pos_indices]
