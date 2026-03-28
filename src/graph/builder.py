@@ -30,6 +30,7 @@ Author: OntoBranch-2026 Team
 import json
 import numpy as np
 import torch
+import zlib
 from typing import Any, Dict, List, Optional, Tuple
 from torch_geometric.data import HeteroData
 from src.generator.base_generator import GLOBAL_ENT_DIM
@@ -100,6 +101,7 @@ class UniversalGraphBuilder:
         # ── relates_to 语义边 ──
         src_list: List[int] = []
         dst_list: List[int] = []
+        edge_attr_list: List[int] = []
 
         for edge in self.raw.get("edges", []):
             src_id = edge["src"]
@@ -114,14 +116,28 @@ class UniversalGraphBuilder:
             src_list.append(self._id_to_idx[src_id])
             dst_list.append(self._id_to_idx[dst_id])
 
+            # 使用稳定的 zlib.crc32 将 semantic_rel 字符串哈希为 0-63 范围的整数
+            semantic_rel = edge.get("semantic_rel")
+            if semantic_rel:
+                attr_val = zlib.crc32(semantic_rel.encode("utf-8")) % 64
+            else:
+                attr_val = 0
+            edge_attr_list.append(attr_val)
+
         if src_list:
             data["entity", "relates_to", "entity"].edge_index = torch.tensor(
                 [src_list, dst_list], dtype=torch.long
+            )
+            data["entity", "relates_to", "entity"].edge_attr = torch.tensor(
+                edge_attr_list, dtype=torch.long
             )
         else:
             # 无语义边时的占位（空 edge_index，保证图结构完整）
             data["entity", "relates_to", "entity"].edge_index = torch.zeros(
                 2, 0, dtype=torch.long
+            )
+            data["entity", "relates_to", "entity"].edge_attr = torch.zeros(
+                0, dtype=torch.long
             )
 
         if self.verbose:

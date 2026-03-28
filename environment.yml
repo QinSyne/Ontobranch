@@ -1,27 +1,31 @@
-name: ontobranch-2026
+name: ontobranch
 channels:
-  - pytorch
-  - nvidia
-  - conda-forge
-  - default
+  # 使用中科大 (USTC) 镜像源
+  - https://mirrors.ustc.edu.cn/anaconda/cloud/pytorch/
+  - https://mirrors.ustc.edu.cn/anaconda/cloud/conda-forge/
+  - https://mirrors.ustc.edu.cn/anaconda/pkgs/main/
+  - https://mirrors.ustc.edu.cn/anaconda/pkgs/free/
+  - nodefaults
+
 dependencies:
   # Core Python
   - python=3.10
   
-  # CUDA support for GPU
+  # PyTorch for Apple Silicon (移除 pytorch:: 前缀以确保走镜像源)
   - pytorch
   - torchvision 
   - torchaudio
-  - pytorch-cuda=12.1  # Adjust to your CUDA version if needed
   
-  # Scientific computing
+  # Scientific computing & Data handling
   - numpy
   - scipy
   - scikit-learn
-  
-  # Data handling  
   - pandas
   - networkx
+  
+  # SCIP & Optimization
+  - ecole>=0.8.1
+  - pyscipopt
   
   # Visualization & Development
   - matplotlib
@@ -35,18 +39,17 @@ dependencies:
   - pip
   - git
   
-  # Pip installations (more complex dependencies)
+  # Pip installations
   - pip:
-    # PyTorch Geometric (install after PyTorch)
+    # 针对当前环境的 pip 使用中科大 PyPI 镜像
+    - -i https://pypi.mirrors.ustc.edu.cn/simple/
+    
+    # PyTorch Geometric
     - torch-geometric
     - torch-scatter
     - torch-sparse  
     - torch-cluster
     - torch-spline-conv
-    
-    # SCIP & Optimization
-    - ecole>=0.8.1
-    - pyscipopt
     
     # Experiment tracking & configs
     - wandb
@@ -60,11 +63,3 @@ dependencies:
     - black
     - isort
     - flake8
-    
-    # Optional (comment out if no license)
-    # - gurobipy
-
-# Post-installation notes:
-# 1. Verify CUDA: python -c "import torch; print(torch.cuda.is_available())"  
-# 2. Test PyG: python -c "import torch_geometric; print('PyG OK')"
-# 3. Test Ecole: python -c "import ecole; print('Ecole OK')"

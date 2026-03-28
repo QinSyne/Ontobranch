@@ -37,6 +37,7 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.generator.employee_scheduling_generator import EmployeeSchedulingGenerator
+from src.generator.facility_location_generator import FacilityLocationGenerator
 from src.generator.base_generator import GLOBAL_ENT_DIM
 
 # ═══════════════════════════════════════════════════════════════════
@@ -49,17 +50,22 @@ from src.generator.base_generator import GLOBAL_ENT_DIM
 #    num_shifts    : 班次数
 # ═══════════════════════════════════════════════════════════════════
 
-DEFAULT_CONFIGS: List[Dict[str, Any]] = [
-    # ── 小规模实例（快速验证） ──
-    {"name": "employee_scheduling_001", "seed": 100, "num_employees": 10, "num_shifts": 12},
-    {"name": "employee_scheduling_002", "seed": 101, "num_employees": 15, "num_shifts": 20},
-    {"name": "employee_scheduling_003", "seed": 102, "num_employees": 20, "num_shifts": 24},
-    # ── 中规模实例（训练用） ──
-    {"name": "employee_scheduling_004", "seed": 200, "num_employees": 30, "num_shifts": 40},
-    {"name": "employee_scheduling_005", "seed": 201, "num_employees": 40, "num_shifts": 48},
+ES_CONFIGS: List[Dict[str, Any]] = [
+    # ── 大规模实例（迫使求解器陷入分支） ──
+    {"name": "employee_scheduling_001", "seed": 300, "num_employees": 100, "num_shifts": 150},
+    {"name": "employee_scheduling_002", "seed": 301, "num_employees": 120, "num_shifts": 180},
+    {"name": "employee_scheduling_003", "seed": 302, "num_employees": 150, "num_shifts": 220},
 ]
 
-OUTPUT_DIR = str(PROJECT_ROOT / "data" / "raw" / "employee_scheduling")
+FLP_CONFIGS: List[Dict[str, Any]] = [
+    # ── 设施选址 FLP 实例 ──
+    {"name": "facility_location_001", "seed": 401, "num_facilities": 30, "num_customers": 100},
+    {"name": "facility_location_002", "seed": 402, "num_facilities": 50, "num_customers": 200},
+    {"name": "facility_location_003", "seed": 403, "num_facilities": 80, "num_customers": 300},
+]
+
+ES_OUTPUT_DIR = str(PROJECT_ROOT / "data" / "raw" / "employee_scheduling")
+FLP_OUTPUT_DIR = str(PROJECT_ROOT / "data" / "raw" / "facility_location")
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -118,7 +124,7 @@ class USGProtocolValidator:
     def _check_edges(self):
         # v3.1：rel 字段已从 JSON 中省略（builder 固定构建为 relates_to）
         # 此处只检查必要字段 src / dst 存在，并确认 semantic_rel 合法
-        valid_rels = {"same_day", "can_cover"}
+        valid_rels = {"same_day", "can_cover", "competing_facility", "same_region"}
         for i, edge in enumerate(self.data.get("edges", [])):
             if "src" not in edge or "dst" not in edge:
                 self.errors.append(f"edges[{i}] 缺少 src 或 dst 字段")
@@ -153,14 +159,15 @@ class USGProtocolValidator:
 #  生成单个实例
 # ───────────────────────────────────────────────────────────────────
 
-def generate_one(cfg: Dict[str, Any], output_dir: str, verbose: bool = True) -> Dict[str, Any]:
+def generate_one(cfg: Dict[str, Any], output_dir: str, generator_type: str = "es", verbose: bool = True) -> Dict[str, Any]:
     """
     生成一个 MILP 实例，返回结果摘要字典。
 
     参数
     ----
-    cfg : 生成配置，包含 name, seed, num_employees, num_shifts
+    cfg : 生成配置
     output_dir : 输出目录
+    generator_type: "es" 或 "flp"
     verbose    : 是否打印详细信息
 
     返回
@@ -169,18 +176,24 @@ def generate_one(cfg: Dict[str, Any], output_dir: str, verbose: bool = True) -> 
     """
     name          = cfg["name"]
     seed          = cfg["seed"]
-    num_employees = cfg["num_employees"]
-    num_shifts    = cfg["num_shifts"]
-
-    gen = EmployeeSchedulingGenerator(seed=seed)
 
     t0 = time.perf_counter()
-    paths = gen.generate(
-        output_dir=output_dir,
-        instance_name=name,
-        num_employees=num_employees,
-        num_shifts=num_shifts,
-    )
+    if generator_type == "es":
+        gen = EmployeeSchedulingGenerator(seed=seed)
+        paths = gen.generate(
+            output_dir=output_dir,
+            instance_name=name,
+            num_employees=cfg["num_employees"],
+            num_shifts=cfg["num_shifts"],
+        )
+    else:
+        gen = FacilityLocationGenerator(seed=seed)
+        paths = gen.generate(
+            output_dir=output_dir,
+            instance_name=name,
+            num_facilities=cfg["num_facilities"],
+            num_customers=cfg["num_customers"],
+        )
     elapsed = (time.perf_counter() - t0) * 1000  # ms
 
     # ── 统计数据 ──
@@ -214,8 +227,6 @@ def generate_one(cfg: Dict[str, Any], output_dir: str, verbose: bool = True) -> 
     result = {
         "name":          name,
         "seed":          seed,
-        "employees":     num_employees,
-        "shifts":        num_shifts,
         "variables":     num_variables,
         "entities":      num_entity_nodes,
         "edges":         num_edges,
@@ -231,8 +242,7 @@ def generate_one(cfg: Dict[str, Any], output_dir: str, verbose: bool = True) -> 
     if verbose:
         status = "✓ PASS" if valid else "✗ FAIL"
         print(f"  [{status}] {name}")
-        print(f"           employees={num_employees}, shifts={num_shifts}, "
-              f"vars={num_variables}")
+        print(f"           vars={num_variables}")
         print(f"           entities={num_entity_nodes}(128-dim), edges={num_edges}, "
               f"one-hot={'OK' if onehot_ok else 'FAIL'}")
         print(f"           LP={result['lp_kb']}KB  |  生成耗时={result['elapsed_ms']}ms")
@@ -250,15 +260,17 @@ def generate_one(cfg: Dict[str, Any], output_dir: str, verbose: bool = True) -> 
 def generate_all(
     configs: List[Dict[str, Any]],
     output_dir: str,
+    generator_type: str = "es",
     dry_run: bool = False,
     verbose: bool = True,
-) -> None:
+) -> List[Dict[str, Any]]:
     """
     批量生成所有实例，打印完整汇总报告。
     """
     print("=" * 65)
     print("  OntoBranch-2026 | USG 实例批量生成器 (data_protocol v3.0)")
     print("=" * 65)
+    print(f"  问题类型  : {generator_type.upper()}")
     print(f"  输出目录  : {output_dir}")
     print(f"  实例数量  : {len(configs)}")
     print(f"  GLOBAL_ENT_DIM : {GLOBAL_ENT_DIM}")
@@ -267,9 +279,8 @@ def generate_all(
     if dry_run:
         print("[DRY RUN] 以下配置将被生成：")
         for cfg in configs:
-            print(f"  {cfg['name']}  seed={cfg['seed']}  "
-                  f"employees={cfg['num_employees']}  shifts={cfg['num_shifts']}")
-        return
+            print(f"  {cfg['name']}  seed={cfg['seed']}")
+        return []
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -278,7 +289,7 @@ def generate_all(
 
     for i, cfg in enumerate(configs):
         print(f"  [{i+1}/{len(configs)}] 生成中...")
-        result = generate_one(cfg, output_dir, verbose=verbose)
+        result = generate_one(cfg, output_dir, generator_type, verbose=verbose)
         results.append(result)
         print()
 
@@ -289,7 +300,7 @@ def generate_all(
     n_fail = len(results) - n_pass
 
     print("=" * 65)
-    print("  汇总报告")
+    print(f"  {generator_type.upper()} 汇总报告")
     print("=" * 65)
     print(f"  总实例数   : {len(results)}")
     print(f"  USG 验证   : {n_pass} PASS  /  {n_fail} FAIL")
@@ -330,10 +341,6 @@ def parse_args():
         help="仅打印配置，不实际生成文件",
     )
     parser.add_argument(
-        "--output-dir", type=str, default=OUTPUT_DIR,
-        help=f"输出目录（默认：{OUTPUT_DIR}）",
-    )
-    parser.add_argument(
         "--quiet", action="store_true",
         help="减少输出详细度",
     )
@@ -343,13 +350,26 @@ def parse_args():
 def main():
     args = parse_args()
 
-    configs = DEFAULT_CONFIGS
+    es_cfg = ES_CONFIGS
+    flp_cfg = FLP_CONFIGS
     if args.num is not None:
-        configs = configs[: args.num]
+        es_cfg = es_cfg[: args.num]
+        flp_cfg = flp_cfg[: args.num]
 
+    print("\n>>> 开始生成 Employee Scheduling (ES) 实例 <<<\n")
     generate_all(
-        configs=configs,
-        output_dir=args.output_dir,
+        configs=es_cfg,
+        output_dir=ES_OUTPUT_DIR,
+        generator_type="es",
+        dry_run=args.dry_run,
+        verbose=not args.quiet,
+    )
+
+    print("\n>>> 开始生成 Facility Location Problem (FLP) 实例 <<<\n")
+    generate_all(
+        configs=flp_cfg,
+        output_dir=FLP_OUTPUT_DIR,
+        generator_type="flp",
         dry_run=args.dry_run,
         verbose=not args.quiet,
     )

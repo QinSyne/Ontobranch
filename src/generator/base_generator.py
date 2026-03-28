@@ -353,5 +353,15 @@ class BaseGenerator(ABC):
             "variable_map": variable_map,
         }
 
+        import re
+        json_str = json.dumps(payload, indent=2, sort_keys=False, ensure_ascii=False)
+        # 将 "features" 的长列表压缩成单行以提升人类可读性（横着摆）和缩小文件体积
+        json_str = re.sub(
+            r'("features":\s*\[)(.*?)(\])',
+            lambda m: m.group(1) + " " + re.sub(r'\s+', '', m.group(2)) + " " + m.group(3),
+            json_str,
+            flags=re.DOTALL
+        )
+
         with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, sort_keys=False, ensure_ascii=False)
+            f.write(json_str)

@@ -48,7 +48,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch_geometric.data import HeteroData
-from torch_geometric.nn import GATConv   #注意力
+from torch_geometric.nn import GATConv, GATv2Conv   #引入支持边特征的注意力机制
 from src.generator.base_generator import GLOBAL_ENT_DIM
 
 
@@ -85,6 +85,7 @@ class OntoGNN(nn.Module):
         num_math_layers: int = 2,
         gat_heads: int = 4,
         gat_dropout: float = 0.1,
+        edge_dim: int = 8,
     ):
         super().__init__()
 
@@ -107,21 +108,21 @@ class OntoGNN(nn.Module):
 
         # ─────────────────────────────────────────────────────────────
         # Stage 1: 语义编码 (Semantic Encoding)
-        #
-        # 单一类型的 GATConv，专门处理：
+        #v2Conv，专门处理：
         #   ("entity", "relates_to", "entity")
         #
-        # 多层堆叠，每层带残差连接。
-        # heads × concat=False → 多头并行取均值，输出 = H
-        # add_self_loops=True  → entity 同构图场景可安全使用自环
+        # 引入了 nn.Embedding 将离散哈希（0-63）映射为连续稠密向量。
+        # GATv2Conv 接受 edge_attr 并将其融合到注意力机制中计算。
         # ─────────────────────────────────────────────────────────────
+        self.edge_emb = nn.Embedding(64, edge_dim)
         self.semantic_convs = nn.ModuleList([
-            GATConv(
+            GATv2Conv(
                 H, H,
                 heads=gat_heads,
                 concat=False,
                 dropout=gat_dropout,
                 add_self_loops=True,
+                edge_dim=edge_dim
             )
             for _ in range(num_semantic_layers)
         ])
@@ -178,16 +179,17 @@ class OntoGNN(nn.Module):
         ])
 
         # ─────────────────────────────────────────────────────────────
-        # Stage 4: 决策头 (Scoring Head)
+        # Stage 4: 决策头 (Scoring Head) - Graph Pointer Network (GPN)
         #
-        # MLP：H → H → 1
-        # 输出 shape = [N_var]（不加 Sigmoid，交给外部 loss 决定）
+        # 基于全局上下文和局部状态，通过 Pointer Network 机制给 variable 打分：
+        #   h_G = mean(h_variable) [1, H]
+        #   query = gpn_q(h_G)     [1, H]
+        #   key = gpn_k(h_var)     [N_var, H]
+        #   scores = gpn_v(tanh(query + key)) [N_var, 1]
         # ─────────────────────────────────────────────────────────────
-        self.scoring_head = nn.Sequential(
-            nn.Linear(H, H),
-            nn.ReLU(),
-            nn.Linear(H, 1),
-        )
+        self.gpn_q = nn.Linear(H, H, bias=False)
+        self.gpn_k = nn.Linear(H, H, bias=False)
+        self.gpn_v = nn.Linear(H, 1, bias=False)
 
     # ─────────────────────────────────────────────────────────────────
     # Stage 0: 特征投影
@@ -219,25 +221,32 @@ class OntoGNN(nn.Module):
         self,
         h_dict: Dict[str, Tensor],
         edge_index_dict: Dict,
+        edge_attr_dict: Dict,
     ) -> Dict[str, Tensor]:
         """
         entity 节点之间的多跳消息传递。
 
-        只处理 ("entity", "relates_to", "entity") 一种边。
-        残差连接：h_new = ReLU(conv(h, ei)) + h_old
-
-        若图中无 relates_to 边（edge_index 为空），GATConv 的
-        add_self_loops=True 确保 entity 节点仍能获得自身信息。
+        提取 `relates_to` 的整数类型边属性，通过 nn.Embedding 查表，
+        随后传入 GATv2Conv 作为 edge_attr，参与注意力分数计算。
+        残差连接：h_new = ReLU(conv(h, ei, edge_attr=ef)) + h_old
         """
         edge_key = ("entity", "relates_to", "entity")
         ei = edge_index_dict.get(edge_key, None)
+        edge_attr = edge_attr_dict.get(edge_key, None)
 
         if ei is None:
             return h_dict
 
+        # 通过 Embedding 层将离散哈希索引 [E] 转化为稠密特征 [E, edge_dim]
+        # (确保设备一致，尽管 nn.Embedding 和 edge_attr 通常在这个阶段都在同一个设备)
+        edge_feat = None
+        if edge_attr is not None and edge_attr.numel() > 0:
+            edge_feat = self.edge_emb(edge_attr)
+
         h_ent = h_dict["entity"]
         for conv in self.semantic_convs:
-            h_ent_new = conv(h_ent, ei)
+            # 传入 edge_attr，让业务关系影响实体间特征聚合
+            h_ent_new = conv(h_ent, ei, edge_attr=edge_feat)
             h_ent = F.relu(h_ent_new) + h_ent   # 残差连接
 
         h_dict["entity"] = h_ent
@@ -394,12 +403,13 @@ class OntoGNN(nn.Module):
         """
         x_dict          = data.x_dict
         edge_index_dict = data.edge_index_dict
+        edge_attr_dict  = data.edge_attr_dict
 
         # Stage 0: 全部节点投影到 hidden_dim
         h_dict = self._project_all(x_dict)
 
-        # Stage 1: entity 节点内部消息传递
-        h_dict = self._semantic_encoding(h_dict, edge_index_dict)
+        # Stage 1: entity 节点内部消息传递，带上边属性业务语义
+        h_dict = self._semantic_encoding(h_dict, edge_index_dict, edge_attr_dict)
 
         # Stage 2: entity → variable 语义注入
         h_dict = self._semantic_injection(h_dict, edge_index_dict)
@@ -407,6 +417,17 @@ class OntoGNN(nn.Module):
         # Stage 3: variable ↔ constraint 二分图推理
         h_dict = self._math_reasoning(h_dict, edge_index_dict)
 
-        # Stage 4: 决策头 → 每个 variable 一个分数
-        scores = self.scoring_head(h_dict["variable"]).squeeze(-1)  # [N_var]
+        # Stage 4: 决策头 → Graph Pointer Network 打分
+        h_var = h_dict["variable"]
+        # 求得当前图的全局平均作为背景上下文，shape: [1, H]
+        h_G = torch.mean(h_var, dim=0, keepdim=True)
+        
+        # 指针注意力计算
+        query = self.gpn_q(h_G)         # [1, H]
+        key = self.gpn_k(h_var)         # [N_var, H]
+        
+        # 广播相加后激活，再投影求分
+        score_feat = torch.tanh(query + key)             # [N_var, H]
+        scores = self.gpn_v(score_feat).squeeze(-1)      # [N_var]
+        
         return scores
