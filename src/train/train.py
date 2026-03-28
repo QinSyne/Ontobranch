@@ -28,20 +28,21 @@ def main():
         print("⚡ Use Device: CPU")
 
     # 2. 初始化核心组件
-    data_dir = "data/raw/employee_scheduling"
+    data_dir = "data/raw" # 直指混合根目录
     if not os.path.exists(data_dir):
         print(f"❌ Error: 数据集目录 '{data_dir}' 不存在，请先确认路径！")
         return
 
     dataset = OntoDataset(data_dir)
-    loader = DataLoader(dataset, batch_size=2, shuffle=True)
+    # 把所有的 5 个图凑在一个 Batch 里面进行史诗级泛化融合测试
+    loader = DataLoader(dataset, batch_size=5, shuffle=True)
     print(f"📦 Dataset loaded: {len(dataset)} graphs found.")
 
     model = OntoGNN(hidden_dim=64).to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     
     # 3. 开启训练循环
-    num_epochs = 10
+    num_epochs = 20
     
     for epoch in range(num_epochs):
         model.train()

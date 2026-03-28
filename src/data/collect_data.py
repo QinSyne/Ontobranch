@@ -100,6 +100,10 @@ def collect_expert_labels(data_dir: str):
 
 
 if __name__ == '__main__':
-    # 针对特定的业务类型开展采集
-    target_dir = "data/raw/employee_scheduling"
-    collect_expert_labels(target_dir)
+    # 遍历 raw 下所有的业务子目录并执行采集
+    base_dir = "data/raw"
+    if os.path.exists(base_dir):
+        for subdir in os.listdir(base_dir):
+            target_dir = os.path.join(base_dir, subdir)
+            if os.path.isdir(target_dir):
+                collect_expert_labels(target_dir)
